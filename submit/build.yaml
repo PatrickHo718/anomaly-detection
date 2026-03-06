@@ -1,1 +1,234 @@
-# cloudformation solution goes here
+AWSTemplateFormatVersion: 2010-09-09
+Description: CloudFormation template that creates an EC2 instance with bootstrapping script, custom EBS volume, S3 bucket, and IAM role for bucket access
+
+Parameters:
+  InstanceType:
+    Description: The EC2 instance type
+    Type: String
+    Default: t3.micro
+    AllowedValues:
+      - t3.micro
+      - t3.small
+      - t3.medium
+  KeyName:
+    Description: Name of an existing EC2 key pair to allow SSH access to the instances
+    Type: 'AWS::EC2::KeyPair::KeyName'
+  SSHLocation:
+    Description: The IP address range that can be used to SSH to the EC2 instances
+    Type: String
+    MinLength: 9
+    MaxLength: 18
+    Default: 0.0.0.0/0
+    ConstraintDescription: must be a valid IP CIDR range of the form x.x.x.x/x.
+  GitRepoURL:
+    Description: URL of the Git repository to clone on the EC2 instance
+    Type: String
+    Default: https://github.com/PatrickHo718/anomaly-detection.git 
+
+Resources:
+  # S3 Bucket
+  S3Bucket:
+    Type: AWS::S3::Bucket
+    DependsOn: SNSTopicPolicy
+    Properties:
+      BucketName: !Sub "${AWS::StackName}-anomaly-bucket-${AWS::AccountId}"
+      NotificationConfiguration:
+        TopicConfigurations:
+          - Event: s3:ObjectCreated:*
+            Filter:
+              S3Key:
+                Rules:
+                  - Name: prefix
+                    Value: raw/
+                  - Name: suffix
+                    Value: .csv
+            Topic: !Ref SNSTopic
+  # IAM Role for EC2 to access S3
+  EC2Role:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub ${AWS::StackName}-ec2-role
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: ec2.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: S3BucketFullAccess
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - s3:GetObject
+                  - s3:PutObject
+                  - s3:ListBucket
+                  - s3:DeleteObject
+                  - s3:GetBucketLocation
+                Resource:
+                  - !GetAtt S3Bucket.Arn
+                  - !Sub "${S3Bucket.Arn}/*"
+  EC2InstanceProfile:
+    Type: AWS::IAM::InstanceProfile
+    Properties:
+      InstanceProfileName: !Sub ${AWS::StackName}-ec2-instance-profile
+      Roles:
+        - !Ref EC2Role
+  # Security Group allowing ports 80 and 22
+  EC2SecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Allow SSH from specific IP and API port 8000 from anywhere
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 22
+          ToPort: 22
+          CidrIp: !Ref SSHLocation
+          Description: Allow SSH access from my IP only
+        - IpProtocol: tcp
+          FromPort: 8000
+          ToPort: 8000
+          CidrIp: 0.0.0.0/0
+          Description: Allow FastAPI access from anywhere
+      Tags:
+        - Key: Name
+          Value: !Sub ${AWS::StackName}-ec2-sg
+
+  # EC2 Instance
+  EC2Instance:
+    Type: AWS::EC2::Instance
+    Properties:
+      ImageId: ami-0e86e20dae9224db8
+      InstanceType: t3.micro
+      KeyName: !Ref KeyName
+      IamInstanceProfile: !Ref EC2InstanceProfile
+      SecurityGroupIds:
+        - !Ref EC2SecurityGroup
+      BlockDeviceMappings:
+        - DeviceName: /dev/sda1
+          Ebs:
+            VolumeSize: 16
+            VolumeType: gp3
+            DeleteOnTermination: true
+      UserData:
+        Fn::Base64: !Sub |
+          #!/bin/bash
+          set -e
+          exec > /var/log/user-data.log 2>&1
+
+          # System update
+          apt-get update -y
+          apt-get install -y git python3 python3-pip python3-venv
+
+          # Set BUCKET variable environment variable
+          export BUCKET_NAME="${AWS::StackName}-anomaly-bucket-${AWS::AccountId}"
+          echo "BUCKET_NAME=${AWS::StackName}-anomaly-bucket-${AWS::AccountId}" >> /etc/environment
+
+          # Clone Git repository
+          git clone ${GitRepoURL} /opt/anomaly-detection
+          chown -R ubuntu:ubuntu /opt/anomaly-detection
+          
+          # Create Python virtual environment and install dependencies
+          python3 -m venv /opt/anomaly-detection/venv
+          /opt/anomaly-detection/venv/bin/pip install --upgrade pip
+          /opt/anomaly-detection/venv/bin/pip install \
+            boto3 \
+            pandas \
+            numpy \
+            requests \
+            "fastapi[standard]" \
+            scikit-learn
+          /opt/anomaly-detection/venv/bin/pip install -r /opt/anomaly-detection/requirements.txt
+
+          # Create systemd service for FastAPI
+          cat > /etc/systemd/system/anomaly-api.service <<EOF
+          [Unit]
+          Description=Anomaly Detection FastAPI Service
+          After=network.target
+
+          [Service]
+          User=ubuntu
+          WorkingDirectory=/opt/anomaly-detection
+          Environment="BUCKET_NAME=${AWS::StackName}-anomaly-bucket-${AWS::AccountId}"
+          ExecStart=/opt/anomaly-detection/venv/bin/fastapi run /opt/anomaly-detection/app.py --host 0.0.0.0 --port 8000
+          Restart=always
+          RestartSec=5
+
+          [Install]
+          WantedBy=multi-user.target
+          EOF
+
+          systemctl daemon-reload
+          systemctl enable anomaly-api
+          systemctl start anomaly-api
+      Tags:
+        - Key: Name
+          Value: !Sub ${AWS::StackName}-ec2-instance
+  # Elastic IP for the EC2 instance
+  EC2ElasticIP:
+    Type: AWS::EC2::EIP
+    Properties:
+      Domain: vpc
+
+  EIPAssociation:
+    Type: AWS::EC2::EIPAssociation
+    Properties:
+      InstanceId: !Ref EC2Instance
+      AllocationId: !GetAtt EC2ElasticIP.AllocationId
+  # SNS topic
+  SNSTopic:
+    Type: AWS::SNS::Topic
+    Properties:
+      TopicName: ds5220-dp1
+  # SNS topic policy to allow S3 to publish to the topic
+  SNSTopicPolicy:
+    Type: AWS::SNS::TopicPolicy
+    Properties:
+      Topics:
+        - !Ref SNSTopic
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: s3.amazonaws.com
+            Action: sns:Publish
+            Resource: !Ref SNSTopic
+            Condition:
+              ArnLike:
+                aws:SourceArn: !Sub "arn:aws:s3:::${AWS::StackName}-anomaly-bucket-${AWS::AccountId}"
+  # SNS http subscription to send notifications to the FastAPI endpoint
+  SNSSubscription:
+    Type: AWS::SNS::Subscription
+    DependsOn: EIPAssociation
+    Properties:
+      TopicArn: !Ref SNSTopic
+      Protocol: http
+      Endpoint: !Sub "http://${EC2ElasticIP}:8000/notify"
+
+Outputs:
+  InstanceId:
+    Description: The EC2 instance ID
+    Value: !Ref EC2Instance
+
+  ElasticIP:
+    Description: The Elastic IP address of the EC2 instance
+    Value: !Ref EC2ElasticIP
+
+  APIEndpoint:
+    Description: The API endpoint URL for the FastAPI service
+    Value: !Sub "http://${EC2ElasticIP}:8000"
+  
+  NotifyEndpoint:
+    Description: The notification endpoint URL for the FastAPI service
+    Value: !Sub "http://${EC2ElasticIP}:8000/notify"
+  
+  BucketName:
+    Description: The name of the S3 bucket
+    Value: !Ref S3Bucket
+  
+  SNSTopicARN:
+    Description: The ARN of the SNS topic
+    Value: !Ref SNSTopic
