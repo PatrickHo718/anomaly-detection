@@ -52,16 +52,18 @@ class BaselineManager:
         if not isinstance(baseline, dict):
             raise ValueError("Baseline must be a dictionary.")
         baseline["last_updated"] = datetime.utcnow().isoformat()
-        try:   
-            s3.put_object(
-                Bucket=self.bucket,
-                Key=self.baseline_key,
-                Body=json.dumps(baseline, indent=2),
-                ContentType="application/json"
-            )
+        log_path = "/var/log/anomaly-app.log"
+        try:
+            with open(log_path, "rb") as f:
+                s3.put_object(
+                    Bucket=self.bucket,
+                    Key="logs/anomaly-app.log",
+                    Body=f.read(),
+                    ContentType="text/plain"
+                )
+            logger.info("Log file synced to S3 | key=logs/anomaly-app.log")
         except Exception as e:
-            logger.error(f"Failed to save baseline: {e}")
-            raise
+            logger.error("Failed to sync log file to S3 | error=%s", e)
 
     def update(self, baseline: dict, channel: str, new_values: list[float]) -> dict:
         """

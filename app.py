@@ -15,7 +15,11 @@ from fastapi import HTTPException
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s [%(levelname)s] %(name)s:%(lineno)d - %(message)s",
-    datefmt="%Y-%m-%dT%H:%M:%S"
+    datefmt="%Y-%m-%dT%H:%M:%S",
+    handlers=[
+        logging.StreamHandler(),                        # stdout (screen)
+        logging.FileHandler("/var/log/anomaly-app.log") # local log file
+    ]
 )
 logger = logging.getLogger(__name__)
 
